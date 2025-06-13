@@ -1,1 +1,0 @@
-# Permite que la carpeta app sea tratada como paquete de Python.
