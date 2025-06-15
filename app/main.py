@@ -41,7 +41,8 @@ Queremos que, al procesarlos, el sistema devuelva una única respuesta JSON, est
 - cómo testearlo desde el navegador tras desplegarlo
 """
 
-from fastapi import FastAPI, UploadFile, File
+import os
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException
 from fastapi.responses import JSONResponse
 from .utils import read_stock_csv, read_ventas_csv, read_historico_csv
 from .custom_logic import (
@@ -58,6 +59,9 @@ from .custom_logic import (
     fecha_ultimo_analisis
 )
 
+# --- Protección por API KEY ---
+API_KEYS = {"4p1k3y_53cr3t4Oc05m06bu51n355"}
+
 app = FastAPI(
     title="Stock, Ventas e Histórico API",
     description="""
@@ -69,12 +73,28 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Middleware para proteger los endpoints con API KEY en header x-api-key
+@app.middleware("http")
+async def verificar_api_key(request: Request, call_next):
+    if request.url.path.startswith("/procesar-todos"):
+        apikey = request.headers.get("x-api-key")
+        if apikey not in API_KEYS:
+            raise HTTPException(status_code=401, detail="Acceso no autorizado. API key inválida.")
+    return await call_next(request)
+
 @app.get("/")
 async def root():
     """Endpoint de health check para Render.com"""
     return { "status": "ok" }
 
-@app.post("/procesar-todos/")
+@app.post("/procesar-todos/", tags=["Procesador"], responses={
+    200: {
+        "content": {"application/json": {}},
+        "description": "JSON con análisis completo (openai) y resumen para dashboard"
+    },
+    401: {"description": "No autorizado, clave API inválida"},
+    400: {"description": "Error de validación o procesamiento"}
+})
 async def procesar_todos(
     stock_file: UploadFile = File(..., description="Archivo stock.csv"),
     ventas_file: UploadFile = File(..., description="Archivo ventas.csv"),
@@ -94,42 +114,45 @@ async def procesar_todos(
     3. Sube los tres archivos CSV con los nombres correctos.
     4. Obtendrás un JSON con dos bloques: openai y dashboard.
     """
-    # Leer archivos CSV a memoria
-    stock_bytes = await stock_file.read()
-    ventas_bytes = await ventas_file.read()
-    historico_bytes = await historico_file.read()
-    stock_df = read_stock_csv(stock_bytes)
-    ventas_df = read_ventas_csv(ventas_bytes)
-    historico_df = read_historico_csv(historico_bytes)
+    try:
+        # Leer archivos CSV a memoria
+        stock_bytes = await stock_file.read()
+        ventas_bytes = await ventas_file.read()
+        historico_bytes = await historico_file.read()
+        stock_df = read_stock_csv(stock_bytes)
+        ventas_df = read_ventas_csv(ventas_bytes)
+        historico_df = read_historico_csv(historico_bytes)
 
-    # --- BLOQUE PARA OPENAI (Make/Agente GPT) ---
-    openai_block = {
-        "productos_bajo_stock": productos_bajo_stock(stock_df),
-        "productos_rotacion_lenta": productos_rotacion_lenta(ventas_df, historico_df, stock_df),
-        "productos_muertos": productos_muertos(ventas_df, stock_df),
-        "top_5_mas_vendidos_mes": top_n_vendidos_mes(ventas_df, stock_df, n=5),
-        "estimaciones_velocidad_venta": estimaciones_velocidad_venta(ventas_df, stock_df),
-        "promedios_unidades_vendidas": promedios_unidades_vendidas(ventas_df),
-        "metricas_globales": metricas_globales(stock_df, ventas_df, historico_df),
-        "eventos_detectados": eventos_detectados(historico_df)
-    }
+        # --- BLOQUE PARA OPENAI (Make/Agente GPT) ---
+        openai_block = {
+            "productos_bajo_stock": productos_bajo_stock(stock_df),
+            "productos_rotacion_lenta": productos_rotacion_lenta(ventas_df, historico_df, stock_df),
+            "productos_muertos": productos_muertos(ventas_df, stock_df),
+            "top_5_mas_vendidos_mes": top_n_vendidos_mes(ventas_df, stock_df, n=5),
+            "estimaciones_velocidad_venta": estimaciones_velocidad_venta(ventas_df, stock_df),
+            "promedios_unidades_vendidas": promedios_unidades_vendidas(ventas_df),
+            "metricas_globales": metricas_globales(stock_df, ventas_df, historico_df),
+            "eventos_detectados": eventos_detectados(historico_df)
+        }
 
-    # --- BLOQUE PARA DASHBOARD (Appsmith/Frontend) ---
-    dashboard_block = {
-        "alerta_stock_bajo": [
-            {
-                "nombre": prod["Producto"],
-                "sku": prod["SKU"],
-                "stock_restante": prod["Stock"]
-            }
-            for prod in productos_bajo_stock(stock_df)
-        ],
-        "resumen_global": resumen_global_dashboard(stock_df, ventas_df, historico_df),
-        "top_3_mas_vendidos": top_3_vendidos_dashboard(ventas_df, stock_df),
-        "fecha_ultimo_analisis": fecha_ultimo_analisis(ventas_df, historico_df)
-    }
+        # --- BLOQUE PARA DASHBOARD (Appsmith/Frontend) ---
+        dashboard_block = {
+            "alerta_stock_bajo": [
+                {
+                    "nombre": prod["Producto"],
+                    "sku": prod["SKU"],
+                    "stock_restante": prod["Stock"]
+                }
+                for prod in productos_bajo_stock(stock_df)
+            ],
+            "resumen_global": resumen_global_dashboard(stock_df, ventas_df, historico_df),
+            "top_3_mas_vendidos": top_3_vendidos_dashboard(ventas_df, stock_df),
+            "fecha_ultimo_analisis": fecha_ultimo_analisis(ventas_df, historico_df)
+        }
 
-    return JSONResponse(content={
-        "openai": openai_block,
-        "dashboard": dashboard_block
-    })
+        return JSONResponse(content={
+            "openai": openai_block,
+            "dashboard": dashboard_block
+        })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error procesando los archivos: {e}")
